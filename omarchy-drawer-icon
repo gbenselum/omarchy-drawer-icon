@@ -1,0 +1,188 @@
+#!/bin/bash
+# omarchy:summary=Recolour the dock's app-drawer icon to match the current theme
+# omarchy:args=[--color <hex>] [--key <key>] [--icon <path>] [--plugin <id>] [--no-reload]
+
+# The dock's app-drawer button (the grid that opens the app grid) is the first
+# slot of the dock: `component AppsSlot` in the dock plugin's DockWindow.qml.
+# It draws a drawer-icon.png sitting beside that file, and the PNG carries its
+# own colour. This resolves a colour from the current theme, rewrites that PNG
+# to it while keeping the artwork's alpha exactly as it was, and restarts the
+# shell so the new colour is on screen.
+#
+# Run it from a `theme-set` hook to keep the drawer on the theme.
+
+set -euo pipefail
+
+PLUGIN_DIR="$HOME/.config/omarchy/plugins"
+KEY="accent"
+FALLBACK="color4"
+COLOR=""
+ICON=""
+PLUGIN=""
+RELOAD=1
+QUIET=0
+
+usage() {
+  cat <<'EOF'
+Recolour the dock's app-drawer icon to match the current theme.
+
+Usage: omarchy-drawer-icon [options]
+
+  -c, --color <hex>      Paint this colour instead of a theme colour
+  -k, --key <key>        Theme colour key to resolve (default: accent)
+  -f, --fallback <key>   Theme key to try if <key> is unset (default: color4)
+  -i, --icon <path>      PNG to rewrite (default: the dock plugin's drawer-icon.png)
+  -p, --plugin <id>      Plugin whose drawer-icon.png to rewrite, eg gabriel.dock
+  -n, --no-reload        Do not restart the shell afterwards
+  -q, --quiet            Print nothing on success
+  -h, --help             Show this help
+
+The PNG keeps its alpha channel, so the artwork's shape cannot change; only its
+colour does. Running it twice with the same colour changes nothing.
+EOF
+}
+
+log() { (( QUIET )) || printf '%s\n' "$*"; }
+die() { printf 'omarchy-drawer-icon: %s\n' "$*" >&2; exit 1; }
+
+while (( $# > 0 )); do
+  case "$1" in
+  -c | --color)
+    (( $# >= 2 )) || die "$1 needs a value"
+    COLOR="$2"
+    shift 2
+    ;;
+  -k | --key)
+    (( $# >= 2 )) || die "$1 needs a value"
+    KEY="$2"
+    shift 2
+    ;;
+  -f | --fallback)
+    (( $# >= 2 )) || die "$1 needs a value"
+    FALLBACK="$2"
+    shift 2
+    ;;
+  -i | --icon)
+    (( $# >= 2 )) || die "$1 needs a value"
+    ICON="$2"
+    shift 2
+    ;;
+  -p | --plugin)
+    (( $# >= 2 )) || die "$1 needs a value"
+    PLUGIN="$2"
+    shift 2
+    ;;
+  -n | --no-reload)
+    RELOAD=0
+    shift
+    ;;
+  -q | --quiet)
+    QUIET=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    die "unknown option: $1"
+    ;;
+  esac
+done
+
+# Find the drawer icon to rewrite: a drawer-icon.png beside a dock plugin's
+# DockWindow.qml. More than one can exist (the built-in dock plus a clone), so
+# prefer the ones omarchy-plugin-list reports as enabled.
+resolve_icon() {
+  if [[ -n $ICON ]]; then
+    printf '%s\n' "$ICON"
+    return
+  fi
+  if [[ -n $PLUGIN ]]; then
+    printf '%s\n' "$PLUGIN_DIR/$PLUGIN/drawer-icon.png"
+    return
+  fi
+
+  local -a found=() enabled=()
+  local path id state
+  for path in "$PLUGIN_DIR"/*/drawer-icon.png; do
+    [[ -e $path ]] && found+=("$path")
+  done
+  (( ${#found[@]} )) || die "no drawer-icon.png under $PLUGIN_DIR (pass --icon)"
+
+  if (( ${#found[@]} > 1 )); then
+    local -A active=()
+    while read -r id state _; do
+      [[ $state == "enabled" ]] && active["$id"]=1
+    done < <(omarchy plugin list 2>/dev/null || true)
+    for path in "${found[@]}"; do
+      id=$(basename "$(dirname "$path")")
+      [[ -n ${active[$id]:-} ]] && enabled+=("$path")
+    done
+  fi
+
+  if (( ${#enabled[@]} == 1 )); then
+    printf '%s\n' "${enabled[0]}"
+  elif (( ${#found[@]} == 1 )); then
+    printf '%s\n' "${found[0]}"
+  else
+    die "several drawer icons to choose from; pass --icon (${found[*]})"
+  fi
+}
+
+icon="$(resolve_icon)"
+[[ -f $icon ]] || die "no such icon: $icon"
+
+# `omarchy-theme-color` resolves a semantic key against the current theme's
+# colors.toml and walks the same alias/fallback cascade the generated configs
+# use, so the drawer gets the same accent every other themed surface gets.
+if [[ -z $COLOR ]]; then
+  COLOR="$(omarchy-theme-color "$KEY" "$FALLBACK")" ||
+    die "could not resolve '$KEY' from the current theme"
+fi
+[[ $COLOR == \#* ]] || COLOR="#$COLOR"
+[[ $COLOR =~ ^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$ ]] ||
+  die "not a hex colour: $COLOR"
+
+# Recolour beside the original and swap in at the end, so an interrupted run
+# can never leave a half-written icon behind. `PNG32:` keeps the output RGBA
+# whatever the input was. -strip drops ImageMagick's date/tIME metadata so one
+# colour always produces the same bytes.
+tmp="$(mktemp "$icon.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+magick "$icon" -strip -fill "$COLOR" -colorize 100% "PNG32:$tmp"
+
+# The alpha channel is the artwork. Refuse the swap if it moved at all.
+alpha_diff="$(magick compare -metric AE <(magick "$icon" -alpha extract png:-) \
+  <(magick "$tmp" -alpha extract png:-) null: 2>&1 || true)"
+[[ $alpha_diff =~ ^0( \(0\))?$ ]] ||
+  die "refusing to replace $icon: the alpha channel changed ($alpha_diff)"
+
+same() {
+  local diff
+  diff="$(magick compare -metric AE "$1" "$2" null: 2>&1 || true)"
+  [[ ${diff%% *} == "0" ]]
+}
+
+theme="$(omarchy-theme-current 2>/dev/null || true)"
+
+if same "$icon" "$tmp"; then
+  # Already this colour: leave the file alone, its mtime included, so the dock
+  # has nothing to reload.
+  log "drawer icon already ${COLOR}${theme:+ (theme $theme)}"
+else
+  chmod --reference="$icon" "$tmp"
+  mv -f -- "$tmp" "$icon"
+
+  log "drawer icon -> ${COLOR}${theme:+ (theme $theme)}"
+fi
+log "  $icon"
+
+# The dock usually re-reads the PNG on its own, so a restart is only about
+# making the change unmistakable. A non-zero exit here (the shell can report
+# its notification service not being ready) must not hide the rewrite above.
+if (( RELOAD )); then
+  log "restarting the shell"
+  omarchy restart shell || printf 'omarchy-drawer-icon: the shell did not report a clean restart; %s still holds the new colour\n' "$icon" >&2
+fi

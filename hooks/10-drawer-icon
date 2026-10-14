@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Keep the dock's app-drawer icon on the theme.
+# Install with: omarchy hook install theme-set hooks/10-drawer-icon
+#
+# $1 is the slug of the theme just set. omarchy-theme-set has already handed the
+# shell the new palette by the time hooks run, and the dock re-reads the PNG when
+# it changes, so this must not restart the shell and fight the intro animation.
+
+set -uo pipefail
+
+# Nothing to do until a plugin actually ships a drawer icon.
+shopt -s nullglob
+icons=("$HOME"/.config/omarchy/plugins/*/drawer-icon.png)
+(( ${#icons[@]} )) || exit 0
+
+tool="$HOME/.local/bin/omarchy-drawer-icon"
+[[ -x $tool ]] || tool="$(command -v omarchy-drawer-icon || true)"
+[[ -x $tool ]] || exit 0
+
+"$tool" --quiet --no-reload
